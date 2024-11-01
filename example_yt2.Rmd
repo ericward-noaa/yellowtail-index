@@ -1,0 +1,195 @@
+---
+title: "Vignette Title"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+Writeup: 
+
+For consistency with previous assessments, we focused on using model configurations that have been adopted in previous assessments (and documented in the 'indexwc' R package). These included exploring models that modeled catch either as a delta_lognormal() or delta_gamma() distribution, the range of knots in meshes used were 250, 300, 400, or 500, we included spatial fields in all models (with separate spatial ranges estimated for spatial and spatiotemporal fields), and truncated depth to be shallower than 425. Like previous assessments, we explored models that included spatiotemporal fields in both sub-model components (presence - absence, positive catch rates), or only one sub-model component (as yellowtail positive catches are sparse, our a priori expectation is that spatiotemporal fields in the positive sub-model will be difficult to estimate). Previous models have also used year (factor) and survey pass as main effects, and that was also adopted for yellowtail. The only difference between this index standardization and most previous assessments is that we included an interaction between region (N/S, split at 40-10) and year, " + region*fyear" allowing trends north and south of 40-10 to be different. Models were fit using sdmTMB 0.6.0.9013. Convergence diagnostics were assessed using the sanity() function, to ensure positive definite Hessian matrices, small standard errors, and small gradients. We were able to several models to converge, and of those both had 400 knots, spatiotemporal fields in the presence-absence submodel (but not positive); the QQ plots were similar, but appeared slightly better for the delta-gamma model. 
+
+
+
+
+
+
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  message = FALSE, 
+  warning = FALSE,
+  comment = "#>"
+)
+```
+
+## Example: yellowtail rockfish
+
+```{r}
+# Packages
+remotes::install_github("pfmc-assessments/nwfscSurvey")
+remotes::install_github("pfmc-assessments/indexwc")
+library(nwfscSurvey)
+library(indexwc)
+library(dplyr)
+library(purrr)
+```
+
+First we'll use the `nwfscSurvey` package to pull the data from the database, and re-format the data with `indexwc::format_data()`. The package includes a configuration file for most species, including default parameter values used for index standardization.
+
+```{r}
+url <- "https://raw.githubusercontent.com/pfmc-assessments/indexwc/refs/heads/main/data-raw/configuration.csv"
+config <- read.csv(url)
+print(config)
+
+config <- dplyr::filter(config, species == "yellowtail rockfish")
+# Adapt for yt 2025
+#config$min_latitude[which(config$species=="yellowtail rockfish")] <- 40 + 1/6
+```
+
+This next chunk pulls the data from the data warehouse, formats the data (lower case names, etc), filters based on depth and latitude ranges. 
+```{r}
+yt_data <- config |>
+  dplyr::filter(species == "yellowtail rockfish") |>
+  dplyr::rowwise() |>
+  dplyr::mutate(
+    data_raw = list(format_data(  dplyr::rename(eval(parse(text = fxn)), Area_swept_ha_der = Area_swept_ha)  )),
+    data_filtered = list(data_raw |>
+      dplyr::filter(
+        depth <= min_depth, depth >= max_depth,
+        latitude >= min_latitude, latitude <= max_latitude,
+        year >= min_year, year <= max_year
+      ))
+  ) %>%
+  dplyr::ungroup()
+
+saveRDS(yt_data$data_filtered[[1]],"yt_data_filtered.rds")
+saveRDS(yt_data$data_raw[[1]],"yt_data_raw.rds")
+```
+
+
+```{r}
+
+# Load the data 
+data_truncated <- readRDS("yt_data_filtered.rds")
+data_truncated$region <- ifelse(data_truncated$latitude > 40.1666667, "N", "S")
+data_truncated$region <- as.factor(data_truncated$region)
+
+models <- expand.grid(knots = c(250, 300, 400, 500),
+                      anisotropy = c(TRUE, FALSE),
+                      spatiotemporal1 = c("off","iid"), spatiotemporal2 = c("off","iid"),
+                      family = c("sdmTMB::delta_gamma()", "sdmTMB::delta_lognormal()"))
+models$converged <- NA
+
+fit <- list() # list to store fitted models
+# create presence-absence variable
+data_truncated$present <- ifelse(data_truncated$catch_weight > 0, 1, 0)
+# switch to one hot encoding
+model_mat <- model.matrix(catch_weight ~ -1 + fyear*region + pass_scaled, data = data_truncated)
+# delete the 2007:S interaction, as there's no values > 0
+# also drop 2003:S because this is absorbed in the intercept
+model_mat <- dplyr::select(as.data.frame(model_mat), -"fyear2007:regionS")
+covariate_formula <- as.formula(paste("present ~", paste(colnames(model_mat), collapse = " + ")))
+# join in model_mat
+data_truncated <- cbind(data_truncated, model_mat)
+data_truncated <- data_truncated[,-which(names(data_truncated)=="pass_scaled")[1]]
+# Create list of variables models
+vars <- c(paste0("fyear", c(2004:2006, 2008:2019, 2021:2023), ":regionS"), "pass_scaled", "region", "fyear", "-1")
+covariate_formula <- as.formula(paste("present ~", paste(vars, collapse = " + ")))
+
+n_models_per_family <- length(which(models$family=="sdmTMB::delta_gamma()"))
+for(i in 1:n_models_per_family) {
+  mesh <- make_mesh(data_truncated, xy_cols = c("x","y"), 
+                    n_knots = models$knots[i])
+  # Run model
+  fit[[i]] <- try(sdmTMB(
+    formula = covariate_formula,
+    time = "year",
+    data = data_truncated,
+    spatial = "on",
+    offset = log(data_truncated$effort),
+    spatiotemporal = list(models$spatiotemporal1[i], models$spatiotemporal2[i]),
+    mesh = mesh,
+    anisotropy = models$anisotropy[i],
+    share_range = FALSE,
+    family = delta_gamma(),
+    control = sdmTMB::sdmTMBcontrol(newton_loops = 2, nlminb_loops = 2)
+  ), silent=TRUE)
+  
+}
+
+for(i in (n_models_per_family+1):nrow(models)) {
+  mesh <- make_mesh(data_truncated, xy_cols = c("x","y"), 
+                    n_knots = models$knots[i])
+  # Run model
+  fit[[i]] <- try(sdmTMB(
+    formula = covariate_formula,
+    time = "year",
+    data = data_truncated,
+    spatial = "on",
+    offset = log(data_truncated$effort),
+    spatiotemporal = list(models$spatiotemporal1[i], models$spatiotemporal2[i]),
+    mesh = mesh,
+    anisotropy = models$anisotropy[i],
+    share_range = FALSE,
+    family = delta_lognormal(),
+    control = sdmTMB::sdmTMBcontrol(newton_loops = 2, nlminb_loops = 2)
+  ), silent=TRUE)
+}
+
+# Passes checks -- find ones that are all ok
+sanity_checks <- lapply(lapply(fit, sanity, silent=TRUE), getElement, 9)
+models$AIC <- unlist(lapply(fit, AIC))
+models$converged <- unlist(sanity_checks)
+models$model <- seq_len(nrow(models))
+conv_models <- dplyr::filter(models, converged == TRUE, anisotropy == TRUE) |>
+  dplyr::filter(!(spatiotemporal1 == "off" & spatiotemporal2 == "off"))# remove models with no spatiotemporal effects in either submodel
+```
+
+QQ Plots from 'indexwc' -- delta gamma looks a tiny bit better? 
+```{r}
+
+plot_qq(fit[[11]], file_name = "dgamma_qq.png")
+plot_qq(fit[[43]], file_name = "dlogn_qq.png")
+```
+
+Index construction -- first extract the grid from 'indexwc' so we're using exactly the same as other assessments
+
+```{r}
+grid <- indexwc:::lookup_grid(
+    x = fit[[11]]$data$survey_name[1],
+    max_latitude = yt_data$max_latitude[1],
+    min_latitude = yt_data$min_latitude[1],
+    max_longitude = Inf,
+    min_longitude = -Inf,
+    max_depth = abs(yt_data$max_depth),
+    years = sort(unique(fit[[11]]$data$year))
+  )
+grid$region <- "N"
+
+gridS <- grid
+gridS$region <- "S"
+grid <- rbind(grid, gridS)
+```
+
+Now make predictions with sdmTMB
+
+```{r}
+# need to add one hot encoding to this grid too
+model_mat <- model.matrix(y ~ -1 + fyear*region, data = grid)
+model_mat <- dplyr::select(as.data.frame(model_mat), -"fyear2007:regionS")
+grid <- cbind(grid, model_mat) |>
+  dplyr::filter(region == "N")
+
+pred <- predict(fit[[11]], newdata = grid, return_tmb_object = TRUE)
+yt_index <- get_index(pred, bias_correct = TRUE)
+saveRDS(yt_index, "yt_index.rds")
+```
+
+
+
